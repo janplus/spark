@@ -19,6 +19,7 @@ package org.apache.spark.sql.catalyst.expressions
 
 import java.net.{MalformedURLException, URL}
 import java.text.{DecimalFormat, DecimalFormatSymbols}
+import java.util.regex.Pattern
 import java.util.{HashMap, Locale, Map => JMap}
 
 import org.apache.spark.sql.catalyst.InternalRow
@@ -27,8 +28,6 @@ import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.{ByteArray, UTF8String}
-
-import scala.util.matching.Regex
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // This file defines expressions for string operations.
@@ -637,6 +636,24 @@ case class ParseUrl(children: Expression*)
   override def inputTypes: Seq[DataType] = Seq.fill(children.size)(StringType)
   override def dataType: DataType = StringType
 
+  private lazy val stringExprs = children.toArray
+  @transient private var lastUrlStr: UTF8String = _
+  @transient private var lastUrl: URL = _
+  // last key in string, we will update the pattern if key value changed.
+  @transient private var lastKey: UTF8String = _
+  // last regex pattern, we cache it for performance concern
+  @transient private var pattern: Pattern = _
+  private lazy val HOST: UTF8String = UTF8String.fromString("HOST")
+  private lazy val PATH: UTF8String = UTF8String.fromString("PATH")
+  private lazy val QUERY: UTF8String = UTF8String.fromString("QUERY")
+  private lazy val REF: UTF8String = UTF8String.fromString("REF")
+  private lazy val PROTOCOL: UTF8String = UTF8String.fromString("PROTOCOL")
+  private lazy val FILE: UTF8String = UTF8String.fromString("FILE")
+  private lazy val AUTHORITY: UTF8String = UTF8String.fromString("AUTHORITY")
+  private lazy val USERINFO: UTF8String = UTF8String.fromString("USERINFO")
+  private lazy val REGEXPREFIX: String = "[&^]?"
+  private lazy val REGEXSUBFIX: String = "=([^&]*)"
+
   override def checkInputDataTypes(): TypeCheckResult = {
     if (children.size > 3 || children.size < 2) {
       TypeCheckResult.TypeCheckFailure("parse_url function requires two or three arguments")
@@ -645,61 +662,71 @@ case class ParseUrl(children: Expression*)
     }
   }
 
-  override def eval(input: InternalRow): Any = {
-    val urlStr = children(0).eval(input)
-    val part = children(1).eval(input)
-    if (urlStr == null || part == null) {
+  def parseUrlWithoutKey(url: Any, partToExtract: Any): Any = {
+    if (url == null || partToExtract == null) {
       null
-    } else if (children.size == 2) {
-      try {
-        val url = new URL(urlStr.toString())
-        val partToExtract = part.toString()
-        if (partToExtract == "HOST") {
-          UTF8String.fromString(url.getHost())
-        } else if (partToExtract == "PATH") {
-          UTF8String.fromString(url.getPath())
-        } else if (partToExtract == "QUERY") {
-          UTF8String.fromString(url.getQuery())
-        } else if (partToExtract == "REF") {
-          UTF8String.fromString(url.getRef())
-        } else if (partToExtract == "PROTOCOL") {
-          UTF8String.fromString(url.getProtocol())
-        } else if (partToExtract == "FILE") {
-          UTF8String.fromString(url.getFile())
-        } else if (partToExtract == "AUTHORITY") {
-          UTF8String.fromString(url.getAuthority())
-        } else if (partToExtract == "USERINFO") {
-          UTF8String.fromString(url.getUserInfo())
-        } else {
-          null
-        }
-      } catch {
-        case ex: MalformedURLException => {
-          null
+    } else {
+      if (lastUrlStr == null || !url.equals(lastUrlStr)) {
+        try {
+          lastUrlStr = url.asInstanceOf[UTF8String].clone()
+          lastUrl = new URL(url.toString)
+        } catch {
+          case ex: MalformedURLException => return null
         }
       }
+
+      if (partToExtract.equals(HOST)) {
+        UTF8String.fromString(lastUrl.getHost)
+      } else if (partToExtract.equals(PATH)) {
+        UTF8String.fromString(lastUrl.getPath)
+      } else if (partToExtract.equals(QUERY)) {
+        UTF8String.fromString(lastUrl.getQuery)
+      } else if (partToExtract.equals(REF)) {
+        UTF8String.fromString(lastUrl.getRef)
+      } else if (partToExtract.equals(PROTOCOL)) {
+        UTF8String.fromString(lastUrl.getProtocol)
+      } else if (partToExtract.equals(FILE)) {
+        UTF8String.fromString(lastUrl.getFile)
+      } else if (partToExtract.equals(AUTHORITY)) {
+        UTF8String.fromString(lastUrl.getAuthority)
+      } else if (partToExtract.equals(USERINFO)) {
+        UTF8String.fromString(lastUrl.getUserInfo)
+      } else {
+        null
+      }
+    }
+  }
+
+  override def eval(input: InternalRow): Any = {
+    val url = stringExprs(0).eval(input)
+    val partToExtract = stringExprs(1).eval(input)
+    if (children.size == 2) {
+      parseUrlWithoutKey(url, partToExtract)
     } else { // children.size == 3
-      val partToExtract = part.toString()
-      val key = children(2).eval(input)
-      if (key == null || partToExtract != "QUERY") {
+      if (partToExtract == null || !partToExtract.equals(QUERY)) {
         null
       } else {
-        try {
-          val url = new URL(urlStr.toString())
-          val query = url.getQuery()
-          if (query == null) {
+        val query = parseUrlWithoutKey(url, partToExtract)
+        if (query == null) {
+          null
+        } else {
+          val key = stringExprs(2).eval(input)
+          if (key == null) {
             null
           } else {
-            val parttern = new Regex("[&^]?" + key.toString() + "=([^&]*)")
-            val parttern(value) = query
-            UTF8String.fromString(value)
-          }
-        } catch {
-          case ex: MalformedURLException => {
-            null
-          }
-          case ex: scala.MatchError => {
-            null
+            if (!key.equals(lastKey)) {
+              lastKey = key.asInstanceOf[UTF8String].clone()
+              val sb = new StringBuilder()
+              sb.append(REGEXPREFIX).append(key.toString).append(REGEXSUBFIX)
+              pattern = Pattern.compile(sb.toString())
+            }
+
+            val m = pattern.matcher(query.toString)
+            if (m.find()) {
+              UTF8String.fromString(m.group(1))
+            } else {
+              null
+            }
           }
         }
       }
